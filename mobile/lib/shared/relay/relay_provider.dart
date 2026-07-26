@@ -51,10 +51,19 @@ class RelayConfig {
     return scheme == null ? _baseUrl : uri.replace(scheme: scheme).toString();
   }
 
-  /// Derive the websocket URL from the HTTP base URL.
+  /// Derive the websocket URL from the configured relay URL.
+  ///
+  /// Invite links already store websocket URLs (`ws://`/`wss://`). Preserve
+  /// those schemes exactly so NIP-42 signs the same relay URL the server
+  /// expects. HTTP(S) URLs are still accepted for dev/config fallback.
   String get wsUrl {
     final uri = Uri.parse(baseUrl);
-    final scheme = uri.scheme == 'https' ? 'wss' : 'ws';
+    final scheme = switch (uri.scheme) {
+      'https' => 'wss',
+      'http' => 'ws',
+      'wss' || 'ws' => uri.scheme,
+      _ => uri.scheme,
+    };
     return uri.replace(scheme: scheme).toString();
   }
 }

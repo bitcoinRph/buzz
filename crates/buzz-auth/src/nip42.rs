@@ -32,6 +32,33 @@ fn normalize_relay_url(raw: &str) -> String {
     parsed.to_string()
 }
 
+fn relay_urls_match(actual: &str, expected: &str) -> bool {
+    let actual_normalized = normalize_relay_url(actual);
+    let expected_normalized = normalize_relay_url(expected);
+    if actual_normalized == expected_normalized {
+        return true;
+    }
+
+    // Buzz mobile invite links already carry `wss://`, but affected builds
+    // derive their socket URL by coercing every non-HTTPS scheme to `ws://`.
+    // Behind StartOS TLS termination the connection still reaches the same
+    // host:port, so accept only the ws<->wss scheme alias when every other URL
+    // component normalizes to the expected relay URL. This preserves the
+    // host/port replay boundary while tolerating the client canonicalization bug.
+    let (Ok(mut actual_url), Ok(expected_url)) = (Url::parse(actual), Url::parse(expected)) else {
+        return false;
+    };
+    if !matches!(actual_url.scheme(), "ws" | "wss")
+        || !matches!(expected_url.scheme(), "ws" | "wss")
+    {
+        return false;
+    }
+    if actual_url.set_scheme(expected_url.scheme()).is_err() {
+        return false;
+    }
+    normalize_relay_url(actual_url.as_str()) == expected_normalized
+}
+
 const TIMESTAMP_TOLERANCE_SECS: u64 = 60;
 
 /// Generate a random NIP-42 challenge (32 CSPRNG bytes, hex-encoded).
@@ -71,7 +98,7 @@ pub fn verify_nip42_event(
         .and_then(|t| t.content())
         .ok_or(AuthError::RelayUrlMismatch)?;
 
-    if normalize_relay_url(relay) != normalize_relay_url(relay_url) {
+    if !relay_urls_match(relay, relay_url) {
         return Err(AuthError::RelayUrlMismatch);
     }
 
@@ -163,6 +190,25 @@ mod tests {
         let event = make_auth_event(&keys, &challenge, "wss://other.example.com");
         assert!(matches!(
             verify_nip42_event(&event, &challenge, TEST_RELAY),
+            Err(AuthError::RelayUrlMismatch)
+        ));
+    }
+
+    #[test]
+    fn ws_and_wss_same_authority_are_equivalent() {
+        let keys = Keys::generate();
+        let challenge = generate_challenge();
+        let event = make_auth_event(&keys, &challenge, "ws://rusty-fingers.local:50596");
+        assert!(verify_nip42_event(&event, &challenge, "wss://rusty-fingers.local:50596").is_ok());
+    }
+
+    #[test]
+    fn ws_and_wss_different_ports_are_rejected() {
+        let keys = Keys::generate();
+        let challenge = generate_challenge();
+        let event = make_auth_event(&keys, &challenge, "ws://rusty-fingers.local:50596");
+        assert!(matches!(
+            verify_nip42_event(&event, &challenge, "wss://rusty-fingers.local"),
             Err(AuthError::RelayUrlMismatch)
         ));
     }
