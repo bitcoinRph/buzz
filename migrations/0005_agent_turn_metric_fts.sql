@@ -22,7 +22,7 @@
 -- NULL tsvector never matches `@@`, so excluded rows are storage-level
 -- unsearchable.
 
-ALTER TABLE events DROP COLUMN search_tsv;
+ALTER TABLE events DROP COLUMN IF EXISTS search_tsv;
 ALTER TABLE events ADD COLUMN search_tsv TSVECTOR GENERATED ALWAYS AS (
     CASE WHEN kind IN (1059, 30300, 30622, 44100, 44101, 44200) THEN NULL::tsvector
          ELSE to_tsvector('simple', content)
