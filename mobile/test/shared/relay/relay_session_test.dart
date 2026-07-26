@@ -11,6 +11,25 @@ import 'package:buzz/shared/auth/auth_provider.dart';
 import 'package:buzz/shared/relay/relay.dart';
 
 void main() {
+  test('RelayConfig.wsUrl preserves websocket invite schemes', () {
+    expect(
+      const RelayConfig(baseUrl: 'wss://rusty-fingers.local:50596').wsUrl,
+      'wss://rusty-fingers.local:50596',
+    );
+    expect(
+      const RelayConfig(baseUrl: 'ws://localhost:3000').wsUrl,
+      'ws://localhost:3000',
+    );
+    expect(
+      const RelayConfig(baseUrl: 'https://relay.example:8443').wsUrl,
+      'wss://relay.example:8443',
+    );
+    expect(
+      const RelayConfig(baseUrl: 'http://relay.example:3000').wsUrl,
+      'ws://relay.example:3000',
+    );
+  });
+
   test('queryRelay sends NIP-98 auth over POST /query', () async {
     final keychain = nostr.Keys.generate();
     final nsec = keychain.nsec;
