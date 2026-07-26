@@ -14,7 +14,7 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 /// Run all pending Buzz database migrations.
 pub async fn run_migrations(pool: &PgPool) -> Result<()> {
     reject_legacy_nip_rs_cardinality_ambiguity(pool).await?;
-    normalize_pre_release_initial_checksum(pool).await?;
+    normalize_pre_release_migration_checksums(pool).await?;
     MIGRATOR.run(pool).await?;
 
     // The replica-fence proof (see `replica_fence`) requires the commit-time
@@ -30,15 +30,15 @@ pub async fn run_migrations(pool: &PgPool) -> Result<()> {
 
 /// Some StartOS pre-release installs booted once from the published
 /// `ghcr.io/block/buzz:0.1.1` relay image, which inserted `_sqlx_migrations`
-/// version 1 with that image's checksum. The StartOS wrapper now builds from
-/// this source tree; the consolidated migration 0001 is semantically the same
-/// baseline for these empty/pre-release databases but has a different embedded
-/// checksum, so SQLx refuses to apply migrations 2+.
+/// rows with that image's checksums. The StartOS wrapper now builds from this
+/// source tree; already-successful migration files can have different embedded
+/// checksums, so SQLx refuses to continue even though later migrations still
+/// need to run.
 ///
-/// Normalize only the stored checksum for already-successful migration 1 to the
-/// embedded checksum, then let SQLx run the remaining migrations normally. This
-/// is intentionally narrower than deleting rows or disabling migrations.
-async fn normalize_pre_release_initial_checksum(pool: &PgPool) -> Result<()> {
+/// Normalize only checksums for already-successful migration versions that also
+/// exist in this embedded migrator, then let SQLx run any unapplied migrations
+/// normally. This is narrower than deleting rows or disabling migrations.
+async fn normalize_pre_release_migration_checksums(pool: &PgPool) -> Result<()> {
     let migrations_table: Option<String> =
         sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations')::text")
             .fetch_one(pool)
@@ -47,28 +47,34 @@ async fn normalize_pre_release_initial_checksum(pool: &PgPool) -> Result<()> {
         return Ok(());
     }
 
-    let Some(initial) = MIGRATOR.iter().find(|migration| migration.version == 1) else {
-        return Ok(());
-    };
-    let embedded_checksum = initial.checksum.as_ref().to_vec();
-
-    let checksum_matches: Option<bool> = sqlx::query_scalar(
-        "SELECT checksum = $1 FROM _sqlx_migrations WHERE version = 1 AND success",
-    )
-    .bind(&embedded_checksum)
-    .fetch_optional(pool)
-    .await?;
-
-    if matches!(checksum_matches, Some(false)) {
-        warn!(
-            "Normalizing StartOS pre-release migration 1 checksum before running remaining migrations"
-        );
-        sqlx::query(
-            "UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 1 AND success",
+    let mut normalized = 0_i64;
+    for migration in MIGRATOR.iter() {
+        let embedded_checksum = migration.checksum.as_ref().to_vec();
+        let checksum_matches: Option<bool> = sqlx::query_scalar(
+            "SELECT checksum = $1 FROM _sqlx_migrations WHERE version = $2 AND success",
         )
         .bind(&embedded_checksum)
-        .execute(pool)
+        .bind(migration.version)
+        .fetch_optional(pool)
         .await?;
+
+        if matches!(checksum_matches, Some(false)) {
+            sqlx::query(
+                "UPDATE _sqlx_migrations SET checksum = $1 WHERE version = $2 AND success",
+            )
+            .bind(&embedded_checksum)
+            .bind(migration.version)
+            .execute(pool)
+            .await?;
+            normalized += 1;
+        }
+    }
+
+    if normalized > 0 {
+        warn!(
+            "Normalized {} StartOS pre-release migration checksum(s) before running remaining migrations",
+            normalized
+        );
     }
 
     Ok(())
