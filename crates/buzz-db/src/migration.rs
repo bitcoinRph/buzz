@@ -47,17 +47,6 @@ async fn should_accept_modified_initial_migration(
     pool: &PgPool,
     error: &sqlx::migrate::MigrateError,
 ) -> Result<bool> {
-    let migrate_compat = std::env::var("BUZZ_ACCEPT_MODIFIED_INITIAL_MIGRATION")
-        .ok()
-        .map(|value| value.to_ascii_lowercase());
-    let enabled = matches!(
-        migrate_compat.as_deref(),
-        Some("true" | "1" | "yes" | "on")
-    );
-    if !enabled {
-        return Ok(false);
-    }
-
     let message = error.to_string();
     if !message.contains("migration 1 was previously applied but has been modified") {
         return Ok(false);
