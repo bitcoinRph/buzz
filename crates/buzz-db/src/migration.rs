@@ -14,7 +14,40 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 /// Run all pending Buzz database migrations.
 pub async fn run_migrations(pool: &PgPool) -> Result<()> {
     reject_legacy_nip_rs_cardinality_ambiguity(pool).await?;
-    run_sqlx_migrations(pool).await?;
+
+    // Pre-check: if the DB was previously booted by a different Buzz image
+    // (e.g. the published ghcr.io/block/buzz:0.1.1 relay), migration 0001
+    // will have a different checksum than our embedded consolidated 0001.
+    // sqlx will refuse to run and MIGRATOR.run will error *after* acquiring
+    // a pooled connection, leaving the connection in a broken transaction
+    // state.  Query the applied-max *before* invoking the migrator so the
+    // decision is made on a clean connection, then skip the migrator entirely
+    // if all embedded migrations are already marked successful.
+    let pre_applied_max = sqlx::query_scalar::<_, i64>(
+        "SELECT max(version) FROM _sqlx_migrations WHERE success",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    let Some(embedded_max) = MIGRATOR.iter().map(|migration| migration.version).max() else {
+        return Ok(());
+    };
+
+    let already_fully_migrated = pre_applied_max
+        .is_some_and(|applied| applied >= embedded_max);
+
+    if already_fully_migrated {
+        warn!(
+            "All {} embedded migrations already applied (max applied = {:?}); \
+             skipping sqlx migrator to avoid checksum-mismatch false failure",
+            embedded_max, pre_applied_max
+        );
+    } else {
+        MIGRATOR.run(pool).await?;
+    }
+
     // The replica-fence proof (see `replica_fence`) requires the commit-time
     // `created_at` floor trigger from migration 0021 — correctly shaped — on
     // the `events` parent and every partition. `CREATE TABLE .. PARTITION OF`
@@ -24,44 +57,6 @@ pub async fn run_migrations(pool: &PgPool) -> Result<()> {
     // re-runs this same check at startup on non-migrating relays.)
     crate::replica_fence::verify_floor_guard_catalog(pool).await?;
     Ok(())
-}
-
-/// Run SQLx migrations, with a narrow compatibility escape hatch for StartOS
-/// pre-release databases that were booted once from the published 0.1.1 relay
-/// image before this package switched to building the relay from source.
-async fn run_sqlx_migrations(pool: &PgPool) -> Result<()> {
-    match MIGRATOR.run(pool).await {
-        Ok(()) => Ok(()),
-        Err(e) if should_accept_modified_initial_migration(pool, &e).await? => {
-            warn!(
-                "Accepting previously-applied migration 1 with a different checksum; \
-                 all embedded migrations are already marked successful"
-            );
-            Ok(())
-        }
-        Err(e) => Err(e.into()),
-    }
-}
-
-async fn should_accept_modified_initial_migration(
-    pool: &PgPool,
-    error: &sqlx::migrate::MigrateError,
-) -> Result<bool> {
-    let message = error.to_string();
-    if !message.contains("migration 1 was previously applied but has been modified") {
-        return Ok(false);
-    }
-
-    let Some(embedded_max) = MIGRATOR.iter().map(|migration| migration.version).max() else {
-        return Ok(false);
-    };
-    let applied_max: Option<i64> = sqlx::query_scalar(
-        "SELECT max(version) FROM _sqlx_migrations WHERE success",
-    )
-    .fetch_one(pool)
-    .await?;
-
-    Ok(applied_max.is_some_and(|version| version >= embedded_max))
 }
 
 /// Migration 0007 is checksum-frozen and predates exact NIP-RS tag-cardinality
