@@ -17,11 +17,18 @@ class RelayConfig {
 
   const RelayConfig({required this.baseUrl, this.nsec});
 
-  /// Derive the websocket URL from the HTTP base URL.
+  /// Derive the websocket URL from the configured base URL.
+  ///
+  /// `baseUrl` may be an HTTP(S) origin (dev config / media base) or already a
+  /// WS(S) URL — invite links are parsed and stored as `wss://…`
+  /// (see `deep_link.dart` / `Community.relayUrl`). Map both secure schemes to
+  /// `wss` and both insecure schemes to `ws`, so an already-`wss` base is not
+  /// silently downgraded to `ws` (which then fails against a TLS-terminated
+  /// relay, e.g. behind StartOS's HTTPS port).
   String get wsUrl {
     final uri = Uri.parse(baseUrl);
-    final scheme = uri.scheme == 'https' ? 'wss' : 'ws';
-    return uri.replace(scheme: scheme).toString();
+    final secure = uri.scheme == 'https' || uri.scheme == 'wss';
+    return uri.replace(scheme: secure ? 'wss' : 'ws').toString();
   }
 }
 
