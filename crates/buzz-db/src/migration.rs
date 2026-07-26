@@ -5,6 +5,7 @@
 //! cutover/backfill is a separate operator script, not startup migration state.
 
 use sqlx::PgPool;
+use tracing::warn;
 
 use crate::Result;
 
@@ -13,7 +14,7 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 /// Run all pending Buzz database migrations.
 pub async fn run_migrations(pool: &PgPool) -> Result<()> {
     reject_legacy_nip_rs_cardinality_ambiguity(pool).await?;
-    MIGRATOR.run(pool).await?;
+    run_sqlx_migrations(pool).await?;
     // The replica-fence proof (see `replica_fence`) requires the commit-time
     // `created_at` floor trigger from migration 0021 — correctly shaped — on
     // the `events` parent and every partition. `CREATE TABLE .. PARTITION OF`
@@ -23,6 +24,55 @@ pub async fn run_migrations(pool: &PgPool) -> Result<()> {
     // re-runs this same check at startup on non-migrating relays.)
     crate::replica_fence::verify_floor_guard_catalog(pool).await?;
     Ok(())
+}
+
+/// Run SQLx migrations, with a narrow compatibility escape hatch for StartOS
+/// pre-release databases that were booted once from the published 0.1.1 relay
+/// image before this package switched to building the relay from source.
+async fn run_sqlx_migrations(pool: &PgPool) -> Result<()> {
+    match MIGRATOR.run(pool).await {
+        Ok(()) => Ok(()),
+        Err(e) if should_accept_modified_initial_migration(pool, &e).await? => {
+            warn!(
+                "Accepting previously-applied migration 1 with a different checksum; \
+                 all embedded migrations are already marked successful"
+            );
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+async fn should_accept_modified_initial_migration(
+    pool: &PgPool,
+    error: &sqlx::migrate::MigrateError,
+) -> Result<bool> {
+    let migrate_compat = std::env::var("BUZZ_ACCEPT_MODIFIED_INITIAL_MIGRATION")
+        .ok()
+        .map(|value| value.to_ascii_lowercase());
+    let enabled = matches!(
+        migrate_compat.as_deref(),
+        Some("true" | "1" | "yes" | "on")
+    );
+    if !enabled {
+        return Ok(false);
+    }
+
+    let message = error.to_string();
+    if !message.contains("migration 1 was previously applied but has been modified") {
+        return Ok(false);
+    }
+
+    let Some(embedded_max) = MIGRATOR.iter().map(|migration| migration.version).max() else {
+        return Ok(false);
+    };
+    let applied_max: Option<i64> = sqlx::query_scalar(
+        "SELECT max(version) FROM _sqlx_migrations WHERE success",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(applied_max.is_some_and(|version| version >= embedded_max))
 }
 
 /// Migration 0007 is checksum-frozen and predates exact NIP-RS tag-cardinality
