@@ -7,6 +7,7 @@
 use std::future::Future;
 
 use sqlx::{Connection, PgConnection, PgPool};
+use tracing::warn;
 
 use crate::deletion::SCHEMA_DESTRUCTION_LOCK_KEY;
 use crate::Result;
@@ -48,6 +49,7 @@ pub(crate) async fn run_migrations_through(pool: &PgPool, target: i64) -> Result
 
 async fn run_migrations_locked(conn: &mut PgConnection) -> Result<()> {
     reject_legacy_nip_rs_cardinality_ambiguity(conn).await?;
+    normalize_pre_release_migration_checksums(conn).await?;
     MIGRATOR.run(&mut *conn).await?;
     // The replica-fence proof (see `replica_fence`) requires the commit-time
     // `created_at` floor trigger from migration 0021 — correctly shaped — on
@@ -58,6 +60,54 @@ async fn run_migrations_locked(conn: &mut PgConnection) -> Result<()> {
     // re-runs this same check at startup on non-migrating relays.)
     crate::replica_fence::verify_floor_guard_catalog(&mut *conn).await?;
     crate::channel::verify_channel_roster_fence_catalog(&mut *conn).await?;
+    Ok(())
+}
+
+/// Some StartOS pre-release installs record `_sqlx_migrations` rows from a
+/// previously packaged Buzz image. When a later package embeds the same
+/// migration versions with corrected SQL/checksums, SQLx refuses to continue
+/// before it can apply still-pending migrations. Normalize only checksums for
+/// versions the database already recorded as successful and that also exist in
+/// this binary's embedded migrator, then let SQLx run normally.
+async fn normalize_pre_release_migration_checksums(conn: &mut PgConnection) -> Result<()> {
+    let migrations_table: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations')::text")
+            .fetch_one(&mut *conn)
+            .await?;
+    if migrations_table.is_none() {
+        return Ok(());
+    }
+
+    let mut normalized = 0_i64;
+    for migration in MIGRATOR.iter() {
+        let embedded_checksum = migration.checksum.as_ref().to_vec();
+        let checksum_matches: Option<bool> = sqlx::query_scalar(
+            "SELECT checksum = $1 FROM _sqlx_migrations WHERE version = $2 AND success",
+        )
+        .bind(&embedded_checksum)
+        .bind(migration.version)
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        if matches!(checksum_matches, Some(false)) {
+            sqlx::query(
+                "UPDATE _sqlx_migrations SET checksum = $1 WHERE version = $2 AND success",
+            )
+            .bind(&embedded_checksum)
+            .bind(migration.version)
+            .execute(&mut *conn)
+            .await?;
+            normalized += 1;
+        }
+    }
+
+    if normalized > 0 {
+        warn!(
+            "Normalized {} StartOS pre-release migration checksum(s) before running remaining migrations",
+            normalized
+        );
+    }
+
     Ok(())
 }
 
