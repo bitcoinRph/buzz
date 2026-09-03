@@ -14,6 +14,17 @@ use crate::Result;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
+const STARTOS_LEGACY_MIGRATION_5_CHECKSUM_HEX: &str =
+    "5f9698c29a6826e7d7826e80745634f4c0db449ab3acfdfb90caee3e86e5e805bf780fd548c9cfa4dcf7e2e5dd13e42a";
+const STARTOS_DESKTOP_0_5_20_MIGRATION_5_CHECKSUM_HEX: &str =
+    "84cf1c768d80480a07bea5b43b83b83d2ff0c3809d2011dcfb751be6a34177c7aab67a9cc2ae8968f50a513edd7d8e83";
+
+fn is_approved_startos_checksum_repair(version: i64, stored: &[u8], embedded: &[u8]) -> bool {
+    version == 5
+        && hex::encode(stored) == STARTOS_LEGACY_MIGRATION_5_CHECKSUM_HEX
+        && hex::encode(embedded) == STARTOS_DESKTOP_0_5_20_MIGRATION_5_CHECKSUM_HEX
+}
+
 /// Run all pending Buzz database migrations.
 ///
 /// The entire run holds the exclusive [`SCHEMA_DESTRUCTION_LOCK_KEY`] session
@@ -63,12 +74,15 @@ async fn run_migrations_locked(conn: &mut PgConnection) -> Result<()> {
     Ok(())
 }
 
-/// Some StartOS pre-release installs record `_sqlx_migrations` rows from a
-/// previously packaged Buzz image. When a later package embeds the same
-/// migration versions with corrected SQL/checksums, SQLx refuses to continue
-/// before it can apply still-pending migrations. Normalize only checksums for
-/// versions the database already recorded as successful and that also exist in
-/// this binary's embedded migrator, then let SQLx run normally.
+/// One StartOS pre-release image shipped migration 5 with a checksum that no
+/// longer matches the otherwise-compatible desktop-v0.5.20 SQL. SQLx refuses
+/// to apply pending migrations until that known drift is repaired.
+///
+/// This repair is deliberately allowlisted and fail-closed: it changes only a
+/// successful migration-5 row whose stored checksum exactly matches the known
+/// legacy StartOS checksum, and only when this binary embeds the expected
+/// desktop-v0.5.20 replacement. Every unknown mismatch is left untouched for
+/// SQLx to reject normally.
 async fn normalize_pre_release_migration_checksums(conn: &mut PgConnection) -> Result<()> {
     let migrations_table: Option<String> =
         sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations')::text")
@@ -78,33 +92,43 @@ async fn normalize_pre_release_migration_checksums(conn: &mut PgConnection) -> R
         return Ok(());
     }
 
-    let mut normalized = 0_i64;
-    for migration in MIGRATOR.iter() {
-        let embedded_checksum = migration.checksum.as_ref().to_vec();
-        let checksum_matches: Option<bool> = sqlx::query_scalar(
-            "SELECT checksum = $1 FROM _sqlx_migrations WHERE version = $2 AND success",
-        )
-        .bind(&embedded_checksum)
-        .bind(migration.version)
-        .fetch_optional(&mut *conn)
-        .await?;
-
-        if matches!(checksum_matches, Some(false)) {
-            sqlx::query(
-                "UPDATE _sqlx_migrations SET checksum = $1 WHERE version = $2 AND success",
+    let migration = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 5)
+        .ok_or_else(|| {
+            crate::DbError::InvalidData(
+                "StartOS checksum repair requires embedded migration 5".to_owned(),
             )
-            .bind(&embedded_checksum)
+        })?;
+    let embedded_checksum = migration.checksum.as_ref().to_vec();
+    let stored_checksum: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = $1 AND success")
             .bind(migration.version)
-            .execute(&mut *conn)
+            .fetch_optional(&mut *conn)
             .await?;
-            normalized += 1;
-        }
+
+    let Some(stored_checksum) = stored_checksum else {
+        return Ok(());
+    };
+    if !is_approved_startos_checksum_repair(migration.version, &stored_checksum, &embedded_checksum)
+    {
+        return Ok(());
     }
 
-    if normalized > 0 {
+    let updated = sqlx::query(
+        "UPDATE _sqlx_migrations SET checksum = $1 \
+         WHERE version = $2 AND success AND checksum = $3",
+    )
+    .bind(&embedded_checksum)
+    .bind(migration.version)
+    .bind(&stored_checksum)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+
+    if updated == 1 {
         warn!(
-            "Normalized {} StartOS pre-release migration checksum(s) before running remaining migrations",
-            normalized
+            "Normalized the known StartOS pre-release migration-5 checksum before running remaining migrations"
         );
     }
 
@@ -228,6 +252,34 @@ mod tests {
     use std::collections::BTreeSet;
 
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
+
+    #[test]
+    fn startos_checksum_repair_allowlist_is_exact() {
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 5)
+            .expect("embedded migration 5");
+        let embedded = migration.checksum.as_ref();
+        let legacy = hex::decode(STARTOS_LEGACY_MIGRATION_5_CHECKSUM_HEX)
+            .expect("valid legacy checksum hex");
+
+        assert!(is_approved_startos_checksum_repair(5, &legacy, embedded));
+        assert!(!is_approved_startos_checksum_repair(4, &legacy, embedded));
+        assert!(!is_approved_startos_checksum_repair(
+            5,
+            &[0x42; 48],
+            embedded
+        ));
+        assert!(!is_approved_startos_checksum_repair(
+            5,
+            &legacy,
+            &[0x24; 48]
+        ));
+        assert_eq!(
+            hex::encode(embedded),
+            STARTOS_DESKTOP_0_5_20_MIGRATION_5_CHECKSUM_HEX
+        );
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ConstraintKind {
